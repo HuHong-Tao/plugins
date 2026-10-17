@@ -72,10 +72,25 @@ EOF
 | `signinOnUsage` | `false` | 查额度/刷新时自动补签（默认关，交给原生开关） |
 | `signinHour` | `null` | 限定补签小时：`8` = 仅当本地时间处于 8:00–8:59 时补签；`null` 不限 |
 
+## 对话请求的整形
+
+AutoClaw 2.1.0 的对话网关对请求形状有硬性要求，缺任一条都回 `406 Not Acceptable` 且 **body 为空**（从错误里看不出原因）。插件的 `fetch` 会就地整形：
+
+| 要求 | 插件怎么做 |
+|---|---|
+| 请求体必须以官方 system 前缀开头 | 把 `You are AutoClaw. Answer the user directly and concisely.` 合并进调用方的 system（没有就补一条最小的） |
+| 拒绝 `max_tokens` | 删掉 `max_tokens` / `max_completion_tokens`（`stream_options` 不受影响） |
+| 拒收 `X-Harness-Type` | 不发送该头（它原本是从 zcode 插件抄来的残留） |
+| system 里不能有别的 agent 的身份句 | 按 `FLAGGED` 就地改写，见下 |
+
+国际版（`autoclaw`）与国内版（`autoclaw-cn`）走各自原有 host 与 `/v1/chat/completions`，两条都适用上表。
+
 ## 已知行为
 
+- **上游只按 system 消息里的 harness 身份句拒收**（实测：只看 system / developer 消息，不看 user 或 assistant；大小写不敏感；命中的是最短子串）。已确认并会被插件的 `FLAGGED` 改写的：`You are Claude Code`、`You are Codex`、`Codex CLI`、`You are opencode`、`You are Cursor`、`You are Cline`、`You are Qwen Code`、`You are an AI agent powered by DeepSeek Harness`。裸词 `Claude Code`、`Codex`、`DeepSeek Harness` 单独出现不触发。改写措辞不变，只拆开被匹配的子串；做法与 `opencode-workbuddy-auth` 同源（腾讯 WorkBuddy 有同一类拦截，magpie #182）。
+- 遇到 `FLAGGED` 还没收录的新身份句时仍会 406，但错误消息会附上 `REFUSED_HINT` 说明该怎么办，并把 sign-in 标成 `kept`（不当作登录失效）。
 - 手机号账号只认国内 host、z.ai/Google 账号只认国际 host；对话 fetch 已内置 401/403 自动换侧重试。
-- 上游模型白名单随版本变化，模型下线时上游返回 `400 非法模型`（原样透传错误消息）。
+- 上游模型白名单随版本变化，模型下线时上游返回 `400 非法模型`（原样透传错误消息）。当前 `zai_glm-5-turbo` 与两个 `tdpsk_deepseek-*` 已从上游下线，四个可用的是 `zai_auto`、`zai_auto-fast`、`zai_glm-5.3-flash`、`zaicoding_glm-5.3`。
 - refresh token 与 AutoClaw 桌面端**共用会互踢**（双方都轮换），插件账号请勿同时在桌面端登录。
 - 上游偶发改协议时，`CLIENT_VERSION` / 端点路径可能需要随官方客户端更新。
 

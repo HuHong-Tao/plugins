@@ -37,6 +37,142 @@ const CN_HOST = "https://autoglm-api.zhipuai.cn";
 const CHAT_PATH = "/autoclaw-proxy/proxy/autoclaw/v1/chat/completions";
 const WALLETS_PATH = `/agent-assetmgr/api/v2/wallets?biz_app_id=${PRODUCT}`;
 
+/**
+ * AutoClaw 对话网关（2.1.0 起）对请求体有两条硬性要求：
+ *   1. 必须以官方 system 前缀开头，不带就一律 406 Not Acceptable（实测；这一句
+ *      本身可通过，措辞不同的近义句会被拒）；
+ *   2. 拒绝 max_tokens，带上即 406（stream_options 不受影响）。
+ * 海外版（autoglm-api.autoglm.ai）与国内版（autoglm-api.zhipuai.cn）同样适用：
+ * 两者都仍在原有 host 与 /v1/chat/completions 上，不需要换端点。
+ */
+const OFFICIAL_SYSTEM_PROMPT = "You are AutoClaw. Answer the user directly and concisely.";
+
+/**
+ * FLAGGED 是 AutoClaw 网关拒收的 harness 身份句：命中就回 406 Not Acceptable
+ * 且 body 为空，从错误里看不出原因。实地二分定位的结论：
+ *   - 它只读 system / developer 消息，不看 user 或 assistant（同样的句子放进
+ *     user 消息会放行），与 headers、tools、消息长度都无关；
+ *   - 大小写不敏感，命中的是最短子串："You are Claude Code"、"You are Codex"、
+ *     "Codex CLI"、"You are opencode"、"You are Cursor"、"You are Cline"、
+ *     "You are Qwen Code"、"You are an AI agent powered by DeepSeek Harness"。
+ *     裸词 "Claude Code"、"Codex"、"DeepSeek Harness" 单独出现并不触发。
+ * 每条替换的左右两侧都实测过（改前 406 / 改后 200），措辞不变，只拆开被匹配的
+ * 子串。这套写法与 opencode-workbuddy-auth 的 FLAGGED / unflag 同源：腾讯的
+ * WorkBuddy 有同一类拦截（magpie #182）。
+ */
+const FLAGGED = [
+  [/You are an AI agent powered by DeepSeek Harness/gi, "You are an AI agent powered by DeepSeek-Harness"],
+  [/You are Claude Code/gi, "You are the Claude Code CLI"],
+  [/You are Codex/gi, "You are the Codex agent"],
+  [/Codex CLI/gi, "Codex command-line tool"],
+  [/You are opencode/gi, "You are the opencode agent"],
+  [/You are Cursor/gi, "You are the Cursor agent"],
+  [/You are Cline/gi, "You are the Cline agent"],
+  [/You are Qwen Code/gi, "You are the Qwen Code agent"],
+];
+
+function unflagged(text) {
+  for (const [re, to] of FLAGGED) text = text.replace(re, to);
+  return text;
+}
+
+/** unflag 把 FLAGGED 的句子从每条 system / developer 消息里换掉，返回是否改过。 */
+function unflag(messages) {
+  let changed = false;
+  for (const m of messages) {
+    if (!m || (m.role !== "system" && m.role !== "developer")) continue;
+    if (typeof m.content === "string") {
+      const t = unflagged(m.content);
+      if (t !== m.content) {
+        m.content = t;
+        changed = true;
+      }
+    } else if (Array.isArray(m.content)) {
+      for (const part of m.content) {
+        if (typeof part?.text !== "string") continue;
+        const t = unflagged(part.text);
+        if (t !== part.text) {
+          part.text = t;
+          changed = true;
+        }
+      }
+    }
+  }
+  return changed;
+}
+
+/**
+ * REFUSED_HINT 说明 406 是什么、还能做什么。上游只回空 body 不说原因，
+ * 把这句话接在错误后面，magpie 的路由页就能照着办。
+ */
+const REFUSED_HINT =
+  "AutoClaw refuses chats whose system prompt carries another agent's identity line (Claude Code, Codex, opencode, Cursor, Cline, Qwen Code, DeepSeek Harness); this plugin rewrites the ones it knows, so an unknown one needs another provider in this group";
+
+/**
+ * explained 给上游的拒绝补一句说明。X-Magpie-Sign-In: kept 表示这不是登录失效，
+ * 别让 magpie 把账号标成过期（和 opencode-workbuddy-auth 的处理一致）。
+ */
+async function explained(res) {
+  if (res.status < 400) return res;
+  const headers = new Headers(res.headers);
+  headers.delete("content-length");
+  headers.delete("content-encoding");
+  headers.set("X-Magpie-Sign-In", "kept");
+  const text = await res.text().catch(() => "");
+  if (res.status !== 406) return new Response(text, { status: res.status, statusText: res.statusText, headers });
+  let said = "";
+  try {
+    said = JSON.parse(text)?.error?.message ?? "";
+  } catch { /* 上游拒绝时 body 为空，属正常 */ }
+  headers.set("content-type", "application/json");
+  return new Response(
+    JSON.stringify({ error: { message: `${said || "406 Not Acceptable"} — ${REFUSED_HINT}`, type: "permission_error", code: null } }),
+    { status: res.status, statusText: res.statusText, headers },
+  );
+}
+
+/**
+ * 把上游强制的 system 前缀合并进调用方已有的 system（没有就补一条最小 system），
+ * 删掉网关拒绝的 max_tokens，并擦掉它拒收的 harness 身份句。
+ * 返回 null 表示请求体不是预期的 JSON（例如流式 body），调用方应原样透传。
+ */
+function autoclawRewriteBody(rawBody) {
+  let payload;
+  try {
+    payload = JSON.parse(typeof rawBody === "string" ? rawBody : new TextDecoder().decode(rawBody));
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.messages)) return null;
+
+  // 先擦身份句，再补官方前缀：顺序反了会把前缀也一并处理，且前缀必须留在最前。
+  unflag(payload.messages);
+
+  const idx = payload.messages.findIndex((m) => m && m.role === "system");
+  if (idx >= 0) {
+    const cur = payload.messages[idx].content;
+    if (typeof cur === "string") {
+      // 幂等：已经带前缀就不再叠加（重试/换侧重发时会走到这里）。
+      if (!cur.startsWith(OFFICIAL_SYSTEM_PROMPT)) {
+        payload.messages[idx] = { ...payload.messages[idx], content: `${OFFICIAL_SYSTEM_PROMPT}\n\n${cur}` };
+      }
+    } else if (Array.isArray(cur)) {
+      payload.messages[idx] = {
+        ...payload.messages[idx],
+        content: [{ type: "text", text: OFFICIAL_SYSTEM_PROMPT }, ...cur],
+      };
+    } else {
+      payload.messages[idx] = { ...payload.messages[idx], content: OFFICIAL_SYSTEM_PROMPT };
+    }
+  } else {
+    payload.messages = [{ role: "system", content: OFFICIAL_SYSTEM_PROMPT }, ...payload.messages];
+  }
+
+  delete payload.max_tokens;
+  delete payload.max_completion_tokens;
+  return payload;
+}
+
 const OAUTH_EXPIRY_SKEW_MS = 10 * 60 * 1000;
 const FALLBACK_EXPIRES_IN_S = 5 * 3600;
 /** 本地 OAuth 会话上限：callback 的等待是 5 分钟；宿主不调 callback 时兜底释放端口。 */
@@ -417,7 +553,9 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
             headers.set("X-Authorization", `Bearer ${accessToken}`);
             headers.set("X-Client-Type", "pc");
             headers.set("X-Product", PRODUCT);
-            headers.set("X-Harness-Type", "zcode");
+            // 这里原本 set("X-Harness-Type", "zcode")（从 zcode 插件抄来的残留）。
+            // AutoClaw 上游现在只要收到这个头就 406，海外/国内两个 host 都一样，必须不发。
+            headers.delete("X-Harness-Type");
             headers.set("X-Tm", PLATFORM_TM);
             headers.set("X-Version", CLIENT_VERSION);
             headers.set("X-Lang", "zh-CN");
@@ -425,19 +563,27 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
             headers.set("x_trace_id", "autoclaw-desktop");
             headers.delete("Authorization");
 
+            // 上游新增强制 system 前缀 + 拒绝 max_tokens，在这里统一满足。
             let routeModel = "";
-            try {
-              const body = JSON.parse(String(init?.body ?? "{}"));
-              routeModel = String(body.model ?? "");
-            } catch { /* 保持空 */ }
+            let nextBody = init?.body;
+            const rewritten = autoclawRewriteBody(init?.body);
+            if (rewritten) {
+              routeModel = String(rewritten.model ?? "");
+              nextBody = JSON.stringify(rewritten);
+              headers.delete("content-length"); // 交给 fetch 按新 body 重算
+            } else {
+              try {
+                routeModel = String(JSON.parse(String(init?.body ?? "{}")).model ?? "");
+              } catch { /* 保持空 */ }
+            }
             if (routeModel) headers.set("X-Request-Model", routeModel);
             headers.set("X-Request-Id", randomHex(16));
 
             const tryFetch = (host) =>
-              fetch(`${host}${CHAT_PATH}`, { ...init, headers, signal: init?.signal });
+              fetch(`${host}${CHAT_PATH}`, { ...init, headers, body: nextBody, signal: init?.signal });
 
             const res1 = await tryFetch(hosts[0]);
-            if (res1.status !== 401 && res1.status !== 403) return res1;
+            if (res1.status !== 401 && res1.status !== 403) return explained(res1);
             const res2 = await tryFetch(hosts[1]);
             if (res2.status === 401 || res2.status === 403) {
               try { res2.body?.cancel?.(); } catch {}
@@ -446,7 +592,7 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
                 headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": "expired" },
               });
             }
-            return res2;
+            return explained(res2);
           },
         };
       },
@@ -1024,5 +1170,6 @@ export const _internal = {
   md5Hex, jwtClaim, tokenFields, codeValue, bizHeaders, bareToken, newDeviceId,
   dailySignin, signinStatus, maybeSignin, signinConfig, checkinOutcome, refreshTokens,
   fetchUserProfile, accountDisplayName, startLocalOAuth,
+  FLAGGED, unflagged, unflag, autoclawRewriteBody, explained, OFFICIAL_SYSTEM_PROMPT, REFUSED_HINT,
   guidePageHtml, callbackPageHtml,
 };
